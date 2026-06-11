@@ -610,27 +610,36 @@ class KorailAPI:
         self.page.on("dialog", _on_dialog)
         try:
             if open_login_page:
-                _ = self.page.goto(LOGIN_URL, wait_until="networkidle")
+                _ = self.page.goto(LOGIN_URL, wait_until="domcontentloaded")
             deadline = time.monotonic() + timeout_s
+            # Korail's SPA keeps /ticket/login in the URL even after success
+            # on some paths, and aggressive loginCheck polling trips the
+            # anti-macro detector. So: ask the user to confirm via the
+            # terminal, then verify with a single loginCheck call.
             while time.monotonic() < deadline:
-                if comm_error_seen:
-                    comm_error_seen = False
+                try:
+                    print(
+                        "\n[로그인 대기] 브라우저에서 로그인을 완료한 후 "
+                        "이 터미널로 돌아와 Enter를 눌러주세요 "
+                        "(취소: Ctrl+C) ",
+                        end="",
+                        flush=True,
+                    )
+                    _ = input()
+                except (EOFError, KeyboardInterrupt):
+                    return False
+
+                if self.is_logged_in():
                     try:
-                        pw_input = self.page.locator("input#password")
-                        if pw_input.count() > 0:
-                            pw_input.first.click(timeout=1_500)
-                            self.page.wait_for_timeout(350)
+                        _ = self.page.goto(SEARCH_URL, wait_until="domcontentloaded")
                     except Exception:
                         pass
-
-                if self.wait_for_login_stable(
-                    timeout_s=0.6,
-                    interval_s=0.3,
-                    stable_checks=2,
-                ):
-                    _ = self.page.goto(SEARCH_URL, wait_until="networkidle")
                     return True
-                time.sleep(1.0)
+
+                print(
+                    "로그인이 확인되지 않았습니다. 브라우저에서 다시 시도한 뒤 "
+                    "Enter를 눌러주세요."
+                )
             return False
         finally:
             self.page.remove_listener("dialog", _on_dialog)

@@ -13,6 +13,7 @@ from playwright.sync_api import (
 from .config import (
     COOKIE_PATH,
     DATA_DIR,
+    EXTRA_HTTP_HEADERS,
     NAV_TIMEOUT,
     SEARCH_URL,
     STEALTH_SCRIPT,
@@ -21,8 +22,9 @@ from .config import (
 
 
 class BrowserManager:
-    def __init__(self, *, headless: bool = True):
+    def __init__(self, *, headless: bool = True, fresh_session: bool = False):
         self._headless: bool = headless
+        self._fresh_session: bool = fresh_session
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -46,19 +48,34 @@ class BrowserManager:
 
     def start(self) -> Page:
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.firefox.launch(headless=self._headless)
+        self._browser = self._playwright.chromium.launch(
+            headless=self._headless,
+            channel="chrome",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+            ],
+            ignore_default_args=[
+                "--enable-automation",
+            ],
+        )
         self._secure_state_permissions()
-        context_kwargs: dict[str, str] = {"locale": "ko-KR"}
-        if STORAGE_STATE_PATH.is_file():
+        context_kwargs: dict[str, object] = {
+            "locale": "ko-KR",
+            "timezone_id": "Asia/Seoul",
+            "extra_http_headers": dict(EXTRA_HTTP_HEADERS),
+        }
+        if not self._fresh_session and STORAGE_STATE_PATH.is_file():
             context_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
         self._context = self._browser.new_context(**context_kwargs)
         self._context.add_init_script(STEALTH_SCRIPT)
         # Backward compatibility with older cookie-only sessions.
-        if not STORAGE_STATE_PATH.is_file():
+        if not self._fresh_session and not STORAGE_STATE_PATH.is_file():
             self._restore_cookies()
         self._page = self._context.new_page()
         self._page.set_default_timeout(NAV_TIMEOUT)
-        _ = self._page.goto(SEARCH_URL, wait_until="networkidle", timeout=NAV_TIMEOUT)
+        # Use "domcontentloaded" instead of "networkidle": korail keeps
+        # background pollers/trackers alive, so networkidle never fires.
+        _ = self._page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         return self._page
 
     # ------------------------------------------------------------------

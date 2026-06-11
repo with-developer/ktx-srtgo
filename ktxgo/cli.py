@@ -1286,9 +1286,10 @@ def _ensure_login(api: KorailAPI, manager: BrowserManager, headless: bool) -> Ko
         click.echo(f"[{_now()}] Logged in via saved session.")
         return api
 
-    def _restart_browser(*, headed: bool) -> KorailAPI:
+    def _restart_browser(*, headed: bool, fresh: bool = False) -> KorailAPI:
         manager.close()
         manager._headless = not headed
+        manager._fresh_session = fresh
         manager.start()
         return KorailAPI(manager.page)
 
@@ -1306,49 +1307,27 @@ def _ensure_login(api: KorailAPI, manager: BrowserManager, headless: bool) -> Ko
         return api_local
 
     creds = _load_login_credentials()
+    # Force a clean session for manual login: the stored storage_state can
+    # carry an anti-macro-flagged JSESSIONID that prevents the server from
+    # issuing fresh cookies, which in turn causes MACRO ERROR on submit.
+    click.echo(
+        f"[{_now()}] Saved session is invalid. Opening browser with a fresh session..."
+    )
+    api = _restart_browser(headed=True, fresh=True)
+
     if creds is not None:
-        login_id, login_pass = creds
-        masked_id = _mask_login_id(login_id)
-        if manager._headless:
-            click.echo(
-                f"[{_now()}] Saved session is invalid. "
-                f"Using visible assisted auto-login ({masked_id})..."
-            )
-            api = _restart_browser(headed=True)
-        else:
-            click.echo(
-                f"[{_now()}] Saved session is invalid. Preparing assisted login ({masked_id})..."
-            )
-
-        prefilled = api.prefill_login_form(login_id, login_pass)
-        if prefilled:
-            click.echo(f"[{_now()}] 로그인 정보 자동입력 완료 ({masked_id}).")
-            click.echo(
-                colored(
-                    "[로그인 필요] 자동으로 접속된 브라우저에서 로그인 버튼을 직접 눌러주세요",
-                    "white",
-                    "on_red",
-                    attrs=["bold"],
-                )
-            )
-            if not api.login_manual(timeout_s=300, open_login_page=False):
-                click.echo("Login timed out.")
-                sys.exit(1)
-            manager.save_cookies()
-            click.echo(f"[{_now()}] Login successful — session saved.")
-            if headless:
-                return _reload_headless_after_login()
-            return api
-        click.echo(f"[{_now()}] Assisted prefill failed. Falling back to manual login.")
-    else:
-        click.echo(f"[{_now()}] No saved auto-login credentials. Skipping auto-login.")
-
-    # Fallback to manual login — must open visible browser
-    if manager._headless:
-        click.echo(f"[{_now()}] Restarting browser for manual login...")
-        api = _restart_browser(headed=True)
-
-    click.echo(f"[{_now()}] Please log in through the browser window (5 min timeout).")
+        click.echo(
+            f"[{_now()}] 저장된 회원번호: {_mask_login_id(creds[0])} "
+            f"(자동입력은 안티매크로에 걸려 비활성화됨 — 브라우저에서 직접 입력해주세요)"
+        )
+    click.echo(
+        colored(
+            "[로그인 필요] 브라우저 창에서 직접 로그인해주세요 (5분 제한)",
+            "white",
+            "on_red",
+            attrs=["bold"],
+        )
+    )
     if not api.login_manual(timeout_s=300):
         click.echo("Login timed out.")
         sys.exit(1)

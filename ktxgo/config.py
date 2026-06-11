@@ -30,13 +30,46 @@ MOBILE_DEVICE = "AD"
 MOBILE_VERSION = "250601002"
 MOBILE_KEY = "korail1234567890"
 
-# Stealth
-STEALTH_SCRIPT = (
-    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-)
+# Stealth — mask Playwright's automation fingerprint.
+# delete-then-redefine is harder to unmask than a single redefine with a getter.
+STEALTH_SCRIPT = """
+(() => {
+  try { delete Object.getPrototypeOf(navigator).webdriver; } catch (e) {}
+  try {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => false,
+      configurable: true,
+    });
+  } catch (e) {}
+  try {
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['ko-KR', 'ko', 'en-US', 'en'],
+      configurable: true,
+    });
+  } catch (e) {}
+  // Spoof plugin and mimeType lists so they are non-empty like real Chrome.
+  try {
+    const fakePlugins = [1, 2, 3, 4, 5].map((i) => ({
+      name: 'Chrome PDF Plugin ' + i,
+      filename: 'internal-pdf-viewer',
+      description: 'Portable Document Format',
+    }));
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => fakePlugins,
+      configurable: true,
+    });
+  } catch (e) {}
+})();
+""".strip()
+
+# Request headers — Accept-Language bare "ko-KR" is a Playwright tell; real
+# Chrome on macOS/Korean sends a q-value chain.
+EXTRA_HTTP_HEADERS = {
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
 # Timeouts
-NAV_TIMEOUT = 30_000
+NAV_TIMEOUT = 300_000
 POLL_INTERVAL_S = 1.2
 
 # Reservation codes
@@ -161,6 +194,7 @@ STATIONS = [
     "익산",
     "전주",
     "광주송정",
+    "나주",
     "목포",
     "순천",
     "청량리",
