@@ -46,6 +46,27 @@ class BrowserManager:
             except OSError:
                 pass
 
+    @staticmethod
+    def _resolve_headed_user_agent(browser: Browser) -> str | None:
+        """Return the browser's UA with the headless marker removed.
+
+        Headless Chrome reports "...HeadlessChrome/<ver>...". DynaPath does a
+        substring match on that token, so we swap it for the plain "Chrome"
+        product string that the headed build sends. Returns None if the UA
+        cannot be read or already lacks the marker (nothing to fix).
+        """
+        try:
+            probe = browser.new_context()
+            try:
+                ua = probe.new_page().evaluate("() => navigator.userAgent")
+            finally:
+                probe.close()
+        except Exception:
+            return None
+        if not isinstance(ua, str) or "Headless" not in ua:
+            return None
+        return ua.replace("HeadlessChrome", "Chrome").replace("Headless", "")
+
     def start(self) -> Page:
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(
@@ -64,6 +85,12 @@ class BrowserManager:
             "timezone_id": "Asia/Seoul",
             "extra_http_headers": dict(EXTRA_HTTP_HEADERS),
         }
+        # Headless Chrome advertises "HeadlessChrome" in its User-Agent, and
+        # korail's DynaPath anti-macro filter blocks that token outright. Read
+        # the real UA and strip the headless marker so headless runs pass.
+        user_agent = self._resolve_headed_user_agent(self._browser)
+        if user_agent is not None:
+            context_kwargs["user_agent"] = user_agent
         if not self._fresh_session and STORAGE_STATE_PATH.is_file():
             context_kwargs["storage_state"] = str(STORAGE_STATE_PATH)
         self._context = self._browser.new_context(**context_kwargs)
