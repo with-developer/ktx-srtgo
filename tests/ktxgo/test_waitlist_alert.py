@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import click
 import pytest
 from click.core import ParameterSource
 from click.testing import CliRunner
 
 from ktxgo import cli
-from ktxgo.korail import KorailAPI, KorailError, Train
+from ktxgo.korail import KorailAPI, KorailError, MacroBlockedError, Train
+
+
+# Saved-date defaults are discarded once the date is in the past, so tests that
+# expect a stored date to survive must use one that is still ahead of today.
+FUTURE_DATE = (datetime.now() + timedelta(days=10)).strftime("%Y%m%d")
 
 
 class _DummyManager:
@@ -65,6 +72,18 @@ def _set_parameter_source(
     ctx._parameter_source[param_name] = source  # type: ignore[attr-defined]
 
 
+def _patch_store_reads(monkeypatch, values: dict[str, str]) -> None:
+    """Route both preference and secret reads at one in-memory mapping."""
+    monkeypatch.setattr(cli.store, "get_pref", lambda key: values.get(key))
+    monkeypatch.setattr(cli.store, "get_secret", lambda key: values.get(key))
+
+
+def _patch_store_writes(monkeypatch, record) -> None:
+    """Route both preference and secret writes at one recorder."""
+    monkeypatch.setattr(cli.store, "set_pref", record)
+    monkeypatch.setattr(cli.store, "set_secret", record)
+
+
 def test_set_waitlist_alert_uses_korail_wait_endpoint() -> None:
     api = KorailAPI.__new__(KorailAPI)
     captured: dict[str, object] = {}
@@ -91,12 +110,11 @@ def test_set_waitlist_alert_uses_korail_wait_endpoint() -> None:
 
 
 def test_resolve_waitlist_alert_phone_prefers_cli_over_keyring(monkeypatch) -> None:
-    monkeypatch.setattr(
-        cli.keyring,
-        "get_password",
-        lambda service, key: {
-            ("KTX", "waitlist_alert_phone"): "01099998888",
-        }.get((service, key)),
+    _patch_store_reads(
+        monkeypatch,
+        {
+            "waitlist_alert_phone": "01099998888",
+        },
     )
 
     assert cli._resolve_waitlist_alert_phone("01012341234") == "01012341234"
@@ -105,28 +123,23 @@ def test_resolve_waitlist_alert_phone_prefers_cli_over_keyring(monkeypatch) -> N
 def test_set_waitlist_alert_phone_interactive_saves_normalized_phone(
     monkeypatch,
 ) -> None:
-    stored: dict[tuple[str, str], str] = {}
+    stored: dict[str, str] = {}
 
     monkeypatch.setattr(
         cli,
         "_prompt_guarded",
         lambda questions: {"phone": "010-1234-5678"},
     )
-    monkeypatch.setattr(
-        cli.keyring,
-        "get_password",
-        lambda service, key: {
-            ("KTX", "waitlist_alert_phone"): "01000000000",
-        }.get((service, key)),
+    _patch_store_reads(
+        monkeypatch,
+        {
+            "waitlist_alert_phone": "01000000000",
+        },
     )
-    monkeypatch.setattr(
-        cli.keyring,
-        "set_password",
-        lambda service, key, value: stored.__setitem__((service, key), value),
-    )
+    _patch_store_writes(monkeypatch, lambda key, value: stored.__setitem__(key, value))
 
     assert cli._set_waitlist_alert_phone_interactive() is True
-    assert stored == {("KTX", "waitlist_alert_phone"): "01012345678"}
+    assert stored == {"waitlist_alert_phone": "01012345678"}
 
 
 def test_interactive_menu_dispatches_waitlist_alert_setting(monkeypatch) -> None:
@@ -259,20 +272,19 @@ def test_cli_keeps_waitlist_success_when_alert_registration_fails(monkeypatch) -
 
 
 def test_load_saved_interactive_defaults_sanitizes_invalid_values(monkeypatch) -> None:
-    monkeypatch.setattr(
-        cli.keyring,
-        "get_password",
-        lambda service, key: {
-            ("KTX", "departure"): "없는역",
-            ("KTX", "arrival"): "서울",
-            ("KTX", "date"): "2026-03-20",
-            ("KTX", "time"): "99",
-            ("KTX", "adults"): "0",
-            ("KTX", "train_types"): "invalid-type",
-            ("KTX", "seat"): "invalid-seat",
-            ("KTX", "auto_pay"): "maybe",
-            ("KTX", "smart_ticket"): "off",
-        }.get((service, key)),
+    _patch_store_reads(
+        monkeypatch,
+        {
+            "departure": "없는역",
+            "arrival": "서울",
+            "date": "2026-03-20",
+            "time": "99",
+            "adults": "0",
+            "train_types": "invalid-type",
+            "seat": "invalid-seat",
+            "auto_pay": "maybe",
+            "smart_ticket": "off",
+        },
     )
 
     defaults = cli._load_saved_interactive_reservation_defaults(
@@ -304,20 +316,19 @@ def test_load_saved_interactive_defaults_sanitizes_invalid_values(monkeypatch) -
 def test_apply_saved_interactive_defaults_preserves_explicit_cli_sources(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        cli.keyring,
-        "get_password",
-        lambda service, key: {
-            ("KTX", "departure"): "대전",
-            ("KTX", "arrival"): "부산",
-            ("KTX", "date"): "20260320",
-            ("KTX", "time"): "13",
-            ("KTX", "adults"): "2",
-            ("KTX", "train_types"): "legacy-all",
-            ("KTX", "seat"): "special",
-            ("KTX", "auto_pay"): "1",
-            ("KTX", "smart_ticket"): "0",
-        }.get((service, key)),
+    _patch_store_reads(
+        monkeypatch,
+        {
+            "departure": "대전",
+            "arrival": "부산",
+            "date": FUTURE_DATE,
+            "time": "13",
+            "adults": "2",
+            "train_types": "legacy-all",
+            "seat": "special",
+            "auto_pay": "1",
+            "smart_ticket": "0",
+        },
     )
     ctx = click.Context(cli.main)
     _set_parameter_source(ctx, "departure", ParameterSource.DEFAULT)
@@ -347,7 +358,7 @@ def test_apply_saved_interactive_defaults_preserves_explicit_cli_sources(
     assert merged == (
         "대전",
         "광명",
-        "20260320",
+        FUTURE_DATE,
         "13",
         1,
         ("ktx", "itx-saemaeul", "mugunghwa", "tonggeun", "itx-cheongchun", "itx-maeum", "airport"),
@@ -360,20 +371,19 @@ def test_apply_saved_interactive_defaults_preserves_explicit_cli_sources(
 def test_apply_saved_interactive_defaults_keeps_default_map_values(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        cli.keyring,
-        "get_password",
-        lambda service, key: {
-            ("KTX", "departure"): "대전",
-            ("KTX", "arrival"): "부산",
-            ("KTX", "date"): "20260320",
-            ("KTX", "time"): "13",
-            ("KTX", "adults"): "2",
-            ("KTX", "train_types"): "legacy-all",
-            ("KTX", "seat"): "special",
-            ("KTX", "auto_pay"): "1",
-            ("KTX", "smart_ticket"): "0",
-        }.get((service, key)),
+    _patch_store_reads(
+        monkeypatch,
+        {
+            "departure": "대전",
+            "arrival": "부산",
+            "date": "20260320",
+            "time": "13",
+            "adults": "2",
+            "train_types": "legacy-all",
+            "seat": "special",
+            "auto_pay": "1",
+            "smart_ticket": "0",
+        },
     )
     ctx = click.Context(cli.main)
     for param_name in (
@@ -426,14 +436,10 @@ def test_prompt_conditions_persists_partial_progress_before_cancellation(
             None,
         ]
     )
-    stored: list[tuple[str, str, str]] = []
+    stored: list[tuple[str, str]] = []
 
     monkeypatch.setattr(cli, "_prompt_guarded", lambda questions: next(answers))
-    monkeypatch.setattr(
-        cli.keyring,
-        "set_password",
-        lambda service, key, value: stored.append((service, key, value)),
-    )
+    _patch_store_writes(monkeypatch, lambda key, value: stored.append((key, value)))
 
     with pytest.raises(SystemExit) as exc_info:
         cli._prompt_conditions(
@@ -448,8 +454,8 @@ def test_prompt_conditions_persists_partial_progress_before_cancellation(
 
     assert exc_info.value.code == 0
     assert stored == [
-        ("KTX", "departure", "서울"),
-        ("KTX", "arrival", "부산"),
+        ("departure", "서울"),
+        ("arrival", "부산"),
     ]
 
 
@@ -458,21 +464,17 @@ def test_prompt_reservation_options_persists_reservation_defaults(monkeypatch) -
         {"seat": "special"},
         {"auto_pay": True},
     ])
-    stored: list[tuple[str, str, str]] = []
+    stored: list[tuple[str, str]] = []
 
     monkeypatch.setattr(cli, "_prompt_guarded", lambda questions: next(answers))
-    monkeypatch.setattr(
-        cli.keyring,
-        "set_password",
-        lambda service, key, value: stored.append((service, key, value)),
-    )
+    _patch_store_writes(monkeypatch, lambda key, value: stored.append((key, value)))
 
     result = cli._prompt_reservation_options("any", False, False)
 
     assert result == ("special", True, False)
     assert stored == [
-        ("KTX", "seat", "special"),
-        ("KTX", "auto_pay", "1"),
+        ("seat", "special"),
+        ("auto_pay", "1"),
     ]
 
 
@@ -483,21 +485,17 @@ def test_prompt_reservation_options_persists_partial_progress_on_cancellation(
         {"seat": "general"},
         None,
     ])
-    stored: list[tuple[str, str, str]] = []
+    stored: list[tuple[str, str]] = []
 
     monkeypatch.setattr(cli, "_prompt_guarded", lambda questions: next(answers))
-    monkeypatch.setattr(
-        cli.keyring,
-        "set_password",
-        lambda service, key, value: stored.append((service, key, value)),
-    )
+    _patch_store_writes(monkeypatch, lambda key, value: stored.append((key, value)))
 
     with pytest.raises(SystemExit) as exc_info:
         cli._prompt_reservation_options("any", False, True)
 
     assert exc_info.value.code == 0
     assert stored == [
-        ("KTX", "seat", "general"),
+        ("seat", "general"),
     ]
 
 
@@ -532,12 +530,8 @@ def test_main_persists_auto_pay_false_after_card_check_fallback(monkeypatch) -> 
     monkeypatch.setattr(cli, "_ensure_card_for_auto_pay", lambda: False)
     monkeypatch.setattr(cli.click, "confirm", lambda message, default=True: True)
 
-    stored: list[tuple[str, str, str]] = []
-    monkeypatch.setattr(
-        cli.keyring,
-        "set_password",
-        lambda service, key, value: stored.append((service, key, value)),
-    )
+    stored: list[tuple[str, str]] = []
+    _patch_store_writes(monkeypatch, lambda key, value: stored.append((key, value)))
 
     class DummyAPI:
         def __init__(self, page: object):
@@ -572,46 +566,117 @@ def test_main_persists_auto_pay_false_after_card_check_fallback(monkeypatch) -> 
         waitlist_alert_phone=None,
     )
 
-    assert ("KTX", "auto_pay", "0") in stored
+    assert ("auto_pay", "0") in stored
 
 
-def test_ensure_login_uses_updated_assisted_login_text(monkeypatch) -> None:
+class _LoginDummyManager:
+    """Manager stub for _ensure_login tests."""
+
+    _headless = True
+    _fresh_session = False
+    page = object()
+
+    def __init__(self, sink: list[str]):
+        self._sink = sink
+
+    def close(self) -> None:
+        pass
+
+    def start(self) -> None:
+        pass
+
+    def save_cookies(self) -> None:
+        self._sink.append("saved")
+
+
+class _LoggedOutAPI:
+    def wait_for_login_stable(self, **kwargs) -> bool:
+        return False
+
+    def login_manual(self, *args, **kwargs) -> bool:
+        raise AssertionError("manual login must not run in this scenario")
+
+
+def _prepare_auto_login_state() -> None:
+    cli._auto_login_attempts.clear()
+    cli._reset_auto_login_failures()
+
+
+def test_ensure_login_prefers_automatic_login(monkeypatch) -> None:
     messages: list[str] = []
-
-    class DummyAPI:
-        def wait_for_login_stable(self, **kwargs) -> bool:
-            return False
-
-        def prefill_login_form(self, login_id: str, login_pass: str) -> bool:
-            assert login_id == "member1234"
-            assert login_pass == "secret"
-            return True
-
-        def login_manual(self, timeout_s: int, open_login_page: bool = True) -> bool:
-            assert timeout_s == 300
-            assert open_login_page is False
-            return True
-
-    class DummyManager:
-        _headless = False
-        page = object()
-
-        def close(self) -> None:
-            raise AssertionError("close should not be called in headed mode")
-
-        def start(self) -> None:
-            raise AssertionError("start should not be called in headed mode")
-
-        def save_cookies(self) -> None:
-            messages.append("saved")
+    auto_api = object()
+    _prepare_auto_login_state()
 
     monkeypatch.setattr(cli, "_load_login_credentials", lambda: ("member1234", "secret"))
+    monkeypatch.setattr(
+        cli, "_attempt_auto_login", lambda manager, creds, headless: auto_api
+    )
+    monkeypatch.setattr(cli.click, "echo", lambda message="": messages.append(str(message)))
+
+    result = cli._ensure_login(_LoggedOutAPI(), _LoginDummyManager(messages), headless=True)
+
+    assert result is auto_api
+    assert "saved" in messages
+
+
+def test_ensure_login_stops_when_macro_blocked(monkeypatch) -> None:
+    messages: list[str] = []
+    _prepare_auto_login_state()
+
+    def _blocked(manager, creds, headless):
+        raise MacroBlockedError("blocked", "macro_err1")
+
+    monkeypatch.setattr(cli, "_load_login_credentials", lambda: ("member1234", "secret"))
+    monkeypatch.setattr(cli, "_attempt_auto_login", _blocked)
     monkeypatch.setattr(cli, "colored", lambda text, *args, **kwargs: text)
     monkeypatch.setattr(cli.click, "echo", lambda message="": messages.append(str(message)))
 
-    result = cli._ensure_login(DummyAPI(), DummyManager(), headless=False)
+    with pytest.raises(SystemExit) as exc_info:
+        cli._ensure_login(_LoggedOutAPI(), _LoginDummyManager(messages), headless=True)
 
-    assert isinstance(result, DummyAPI)
-    assert "[로그인 필요] 자동으로 접속된 브라우저에서 로그인 버튼을 직접 눌러주세요" in messages
-    assert "saved" in messages
-    assert messages[-1] == "[20:49:33] Login successful — session saved." or messages[-1].endswith("Login successful — session saved.")
+    assert exc_info.value.code == 1
+    assert any("안티매크로 차단 감지" in message for message in messages)
+    # A block must never be answered with another login attempt.
+    assert "saved" not in messages
+
+
+def test_ensure_login_stops_once_auto_login_budget_is_spent(monkeypatch) -> None:
+    messages: list[str] = []
+    attempts: list[int] = []
+    _prepare_auto_login_state()
+    cli._auto_login_attempts.extend(
+        [cli.time.monotonic()] * cli._AUTO_LOGIN_MAX_IN_WINDOW
+    )
+
+    class _NoTTY:
+        @staticmethod
+        def isatty() -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_load_login_credentials", lambda: ("member1234", "secret"))
+    monkeypatch.setattr(
+        cli,
+        "_attempt_auto_login",
+        lambda manager, creds, headless: attempts.append(1),
+    )
+    monkeypatch.setattr(cli.sys, "stdin", _NoTTY())
+    monkeypatch.setattr(cli.click, "echo", lambda message="": messages.append(str(message)))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli._ensure_login(_LoggedOutAPI(), _LoginDummyManager(messages), headless=True)
+
+    assert exc_info.value.code == 1
+    assert attempts == []
+    assert any("자동 로그인 한도 초과" in message for message in messages)
+
+
+def test_auto_login_backoff_grows_with_consecutive_failures() -> None:
+    _prepare_auto_login_state()
+    assert cli._auto_login_backoff_delay() == 0.0
+    delays = []
+    for failures in range(1, len(cli._AUTO_LOGIN_BACKOFF_S) + 2):
+        cli._auto_login_failures = failures
+        delays.append(cli._auto_login_backoff_delay())
+    assert delays == sorted(delays)
+    assert delays[-1] == cli._AUTO_LOGIN_BACKOFF_S[-1]
+    _prepare_auto_login_state()

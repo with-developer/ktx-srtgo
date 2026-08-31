@@ -6,17 +6,16 @@ import sys
 import time
 import unicodedata
 from datetime import datetime, timedelta
-from typing import cast
+from typing import NoReturn, cast
 
 import click
 import inquirer
-import keyring
 from click.core import ParameterSource
 from termcolor import colored
 
-from srtgo.keyring_bootstrap import configure_keyring_backend
-
+from . import store
 from .browser import BrowserManager
+from .keyring_bootstrap import configure_keyring_backend
 from .config import (
     COOKIE_PATH,
     DEFAULT_ARRIVAL,
@@ -31,7 +30,7 @@ from .config import (
     normalize_train_types,
     TRAIN_TYPE_CODE_BY_NAME,
 )
-from .korail import KorailAPI, KorailError, Train
+from .korail import KorailAPI, KorailError, MacroBlockedError, Train
 
 try:
     import termios
@@ -40,6 +39,15 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 # Session-expired error codes returned by Korail.
 _SESSION_EXPIRED_CODES = {"P058", "WRT300004", "WRD000003"}
+# Automatic re-login guards. A session that keeps dropping — or an account
+# being throttled — must not turn into an endless login loop, so attempts are
+# capped inside a sliding window and spaced out after each failure.
+_AUTO_LOGIN_WINDOW_S = 3600.0
+_AUTO_LOGIN_MAX_IN_WINDOW = 3
+_AUTO_LOGIN_BACKOFF_S = (30.0, 60.0, 120.0)
+_MAX_CONSECUTIVE_SEARCH_ERRORS = 5
+_auto_login_attempts: list[float] = []
+_auto_login_failures = 0
 _INTERACTIVE_SCOPE_KTX_ONLY = "ktx_only"
 _INTERACTIVE_SCOPE_KTX_PLUS_GENERAL = "ktx_plus_general"
 _INTERACTIVE_TRAIN_SCOPE_CHOICES = [
@@ -51,7 +59,6 @@ TrainKey = tuple[str, str, str, str, str]
 ReservationPlan = tuple[str, bool]  # (seat_type, waitlist)
 _PROMPT_INPUT_GUARD_S = 0.18
 _LAST_PROMPT_FINISHED_AT: float | None = None
-_INTERACTIVE_DEFAULT_SERVICE = "KTX"
 _INTERACTIVE_BOOL_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _INTERACTIVE_BOOL_FALSE_VALUES = {"0", "false", "no", "n", "off"}
 _INTERACTIVE_SEAT_CHOICES = {"general", "special", "any", "standing"}
@@ -114,7 +121,7 @@ def _validate_adults(value: int) -> int:
 
 
 def _load_interactive_default(key: str) -> str | None:
-    return keyring.get_password(_INTERACTIVE_DEFAULT_SERVICE, key)
+    return store.get_pref(key)
 
 
 def _save_interactive_default(key: str, value: object) -> None:
@@ -126,7 +133,7 @@ def _save_interactive_default(key: str, value: object) -> None:
         serialized = "1" if bool(value) else "0"
     else:
         serialized = str(value)
-    keyring.set_password(_INTERACTIVE_DEFAULT_SERVICE, key, serialized)
+    store.set_pref(key, serialized)
 
 
 def _sanitize_saved_station(
@@ -516,8 +523,8 @@ def _mask_login_id(login_id: str) -> str:
 
 
 def _load_login_credentials() -> tuple[str, str] | None:
-    login_id = (keyring.get_password("KTX", "id") or "").strip()
-    login_pass = (keyring.get_password("KTX", "pass") or "").strip()
+    login_id = (store.get_secret("id") or "").strip()
+    login_pass = (store.get_secret("pass") or "").strip()
     if not login_id or not login_pass:
         return None
     return login_id, login_pass
@@ -525,8 +532,8 @@ def _load_login_credentials() -> tuple[str, str] | None:
 
 def _set_login_credentials_interactive() -> bool:
     defaults = {
-        "id": keyring.get_password("KTX", "id") or "",
-        "pass": keyring.get_password("KTX", "pass") or "",
+        "id": store.get_secret("id") or "",
+        "pass": store.get_secret("pass") or "",
     }
     login_info = _prompt_guarded(
         [
@@ -552,8 +559,8 @@ def _set_login_credentials_interactive() -> bool:
         click.echo("입력 오류: 회원번호와 비밀번호를 모두 입력하세요.")
         return False
 
-    keyring.set_password("KTX", "id", login_id)
-    keyring.set_password("KTX", "pass", login_pass)
+    store.set_secret("id", login_id)
+    store.set_secret("pass", login_pass)
     click.echo(
         f"자동로그인 계정이 저장되었습니다. (회원번호: {_mask_login_id(login_id)})"
     )
@@ -703,7 +710,7 @@ def _configure_login_interactive() -> None:
 
 
 def _load_visible_stations() -> list[str]:
-    station_key = keyring.get_password("KTX", "station")
+    station_key = store.get_pref("station")
     if not station_key:
         return [station for station in STATIONS if station in DEFAULT_VISIBLE_STATIONS]
 
@@ -746,14 +753,14 @@ def _set_visible_stations_interactive() -> bool:
     selected_set = set(selected)
     ordered_selected = [station for station in STATIONS if station in selected_set]
     selected_stations = ",".join(ordered_selected)
-    keyring.set_password("KTX", "station", selected_stations)
+    store.set_pref("station", selected_stations)
     click.echo(f"선택된 역: {selected_stations}")
     return True
 
 
 def _set_waitlist_alert_phone_interactive() -> bool:
     defaults = {
-        "phone": keyring.get_password("KTX", "waitlist_alert_phone") or "",
+        "phone": store.get_secret("waitlist_alert_phone") or "",
     }
     waitlist_info = _prompt_guarded(
         [
@@ -774,7 +781,7 @@ def _set_waitlist_alert_phone_interactive() -> bool:
         click.echo("입력 오류: 전화번호를 숫자로 입력하세요.")
         return False
 
-    keyring.set_password("KTX", "waitlist_alert_phone", digits_only)
+    store.set_secret("waitlist_alert_phone", digits_only)
     click.echo(f"예약대기 SMS 알림 번호가 저장되었습니다. ({digits_only})")
     return True
 
@@ -1280,11 +1287,95 @@ def _print_results(trains: list[Train]) -> None:
         click.echo(row)
 
 
+def _abort_macro_blocked(exc: KorailError, *, phase: str) -> NoReturn:
+    """Stop the run after an anti-macro block. Retrying only deepens it."""
+    click.echo()
+    click.echo(
+        colored(
+            f"[{_now()}] 안티매크로 차단 감지 ({phase})",
+            "white",
+            "on_red",
+            attrs=["bold"],
+        )
+    )
+    click.echo(f"  응답: {exc}")
+    click.echo(
+        "  재시도하면 차단이 강화되므로 즉시 중지합니다.\n"
+        "  시간을 두고(수십 분 이상) 다시 시도하고, 그 전에 브라우저에서\n"
+        "  korail.com이 정상 이용되는지 확인하세요."
+    )
+    sys.exit(1)
+
+
+def _auto_login_slots_left() -> int:
+    """Remaining automatic logins allowed inside the sliding window."""
+    cutoff = time.monotonic() - _AUTO_LOGIN_WINDOW_S
+    _auto_login_attempts[:] = [at for at in _auto_login_attempts if at >= cutoff]
+    return _AUTO_LOGIN_MAX_IN_WINDOW - len(_auto_login_attempts)
+
+
+def _auto_login_backoff_delay() -> float:
+    if _auto_login_failures <= 0:
+        return 0.0
+    idx = min(_auto_login_failures, len(_AUTO_LOGIN_BACKOFF_S)) - 1
+    return _AUTO_LOGIN_BACKOFF_S[idx]
+
+
+def _reset_auto_login_failures() -> None:
+    global _auto_login_failures
+    _auto_login_failures = 0
+
+
+def _attempt_auto_login(
+    manager: BrowserManager, creds: tuple[str, str], *, headless: bool
+) -> KorailAPI | None:
+    """Run one automated login (prefill + a single submit).
+
+    Returns a logged-in API handle, or None when the attempt failed. Raises
+    MacroBlockedError if Korail flagged the submit as automation.
+    """
+    global _auto_login_failures
+
+    delay = _auto_login_backoff_delay()
+    if delay > 0:
+        click.echo(f"[{_now()}] 자동 로그인 재시도 대기 {int(delay)}초...")
+        time.sleep(delay)
+
+    _auto_login_attempts.append(time.monotonic())
+    click.echo(f"[{_now()}] 자동 로그인 시도 ({_mask_login_id(creds[0])})...")
+
+    manager.close()
+    manager._headless = headless
+    # A stored JSESSIONID that anti-macro already flagged prevents the server
+    # from issuing fresh cookies, so always start the login from a clean slate.
+    manager._fresh_session = True
+    manager.start()
+    api = KorailAPI(manager.page)
+
+    if not api.prefill_login_form(creds[0], creds[1]):
+        _auto_login_failures += 1
+        click.echo(f"[{_now()}] 자동 로그인 실패: 로그인 폼을 찾지 못했습니다.")
+        return None
+
+    # Exactly one submit: repeated automated submits are what trips DynaPath.
+    if not api.submit_prefilled_login(timeout_s=20, max_attempts=1):
+        _auto_login_failures += 1
+        detail = api.last_auto_login_detail or api.last_auto_login_error or "원인 미상"
+        click.echo(f"[{_now()}] 자동 로그인 실패: {detail}")
+        return None
+
+    _reset_auto_login_failures()
+    return api
+
+
 def _ensure_login(api: KorailAPI, manager: BrowserManager, headless: bool) -> KorailAPI:
     """Ensure the session is authenticated. Returns (possibly new) KorailAPI instance."""
-    if api.wait_for_login_stable(timeout_s=0.8, interval_s=0.25, stable_checks=1):
-        click.echo(f"[{_now()}] Logged in via saved session.")
-        return api
+    try:
+        if api.wait_for_login_stable(timeout_s=0.8, interval_s=0.25, stable_checks=1):
+            click.echo(f"[{_now()}] Logged in via saved session.")
+            return api
+    except MacroBlockedError as exc:
+        _abort_macro_blocked(exc, phase="로그인 상태 확인")
 
     def _restart_browser(*, headed: bool, fresh: bool = False) -> KorailAPI:
         manager.close()
@@ -1307,19 +1398,43 @@ def _ensure_login(api: KorailAPI, manager: BrowserManager, headless: bool) -> Ko
         return api_local
 
     creds = _load_login_credentials()
-    # Force a clean session for manual login: the stored storage_state can
+    click.echo(f"[{_now()}] Saved session is invalid.")
+
+    # Automatic re-login first, so an overnight session drop recovers without
+    # a human. The sliding-window budget and backoff live in the helpers.
+    if creds is not None:
+        if _auto_login_slots_left() > 0:
+            try:
+                auto_api = _attempt_auto_login(manager, creds, headless=headless)
+            except MacroBlockedError as exc:
+                _abort_macro_blocked(exc, phase="자동 로그인")
+            if auto_api is not None:
+                manager.save_cookies()
+                # Later restarts should reuse the session we just saved.
+                manager._fresh_session = False
+                click.echo(f"[{_now()}] 자동 로그인 성공 — 세션 저장 완료.")
+                return auto_api
+        else:
+            click.echo(
+                f"[{_now()}] 자동 로그인 한도 초과 "
+                f"({_AUTO_LOGIN_MAX_IN_WINDOW}회/"
+                f"{int(_AUTO_LOGIN_WINDOW_S // 60)}분) — 자동 재시도를 중단합니다."
+            )
+
+    if not sys.stdin.isatty():
+        click.echo(
+            "무인 실행 중이라 수동 로그인을 진행할 수 없습니다. 종료합니다."
+        )
+        sys.exit(1)
+
+    # Manual fallback. Force a clean session: the stored storage_state can
     # carry an anti-macro-flagged JSESSIONID that prevents the server from
     # issuing fresh cookies, which in turn causes MACRO ERROR on submit.
-    click.echo(
-        f"[{_now()}] Saved session is invalid. Opening browser with a fresh session..."
-    )
+    click.echo(f"[{_now()}] 수동 로그인으로 전환합니다. 브라우저를 엽니다...")
     api = _restart_browser(headed=True, fresh=True)
 
     if creds is not None:
-        click.echo(
-            f"[{_now()}] 저장된 회원번호: {_mask_login_id(creds[0])} "
-            f"(자동입력은 안티매크로에 걸려 비활성화됨 — 브라우저에서 직접 입력해주세요)"
-        )
+        click.echo(f"[{_now()}] 저장된 회원번호: {_mask_login_id(creds[0])}")
     click.echo(
         colored(
             "[로그인 필요] 브라우저 창에서 직접 로그인해주세요 (5분 제한)",
@@ -1341,11 +1456,11 @@ def _ensure_login(api: KorailAPI, manager: BrowserManager, headless: bool) -> Ko
 
 
 def _load_card() -> dict[str, str] | None:
-    """Load card info from keyring. Returns dict or None if not configured."""
-    card_number = keyring.get_password("KTX", "card_number")
-    card_password = keyring.get_password("KTX", "card_password")
-    birthday = keyring.get_password("KTX", "birthday")
-    card_expire = keyring.get_password("KTX", "card_expire")
+    """Load card info from the secret store. None if not configured."""
+    card_number = store.get_secret("card_number")
+    card_password = store.get_secret("card_password")
+    birthday = store.get_secret("birthday")
+    card_expire = store.get_secret("card_expire")
     if not all([card_number, card_password, birthday, card_expire]):
         return None
     return {
@@ -1357,12 +1472,12 @@ def _load_card() -> dict[str, str] | None:
 
 
 def _set_card_interactive() -> bool:
-    """Set card info using TTY prompts and save to keyring."""
+    """Set card info using TTY prompts and save to the secret store."""
     defaults = {
-        "card_number": keyring.get_password("KTX", "card_number") or "",
-        "card_password": keyring.get_password("KTX", "card_password") or "",
-        "birthday": keyring.get_password("KTX", "birthday") or "",
-        "card_expire": keyring.get_password("KTX", "card_expire") or "",
+        "card_number": store.get_secret("card_number") or "",
+        "card_password": store.get_secret("card_password") or "",
+        "birthday": store.get_secret("birthday") or "",
+        "card_expire": store.get_secret("card_expire") or "",
     }
 
     card_info = _prompt_guarded(
@@ -1412,10 +1527,10 @@ def _set_card_interactive() -> bool:
         click.echo("입력 오류: 유효기간은 YYMM 4자리 숫자입니다.")
         return False
 
-    keyring.set_password("KTX", "card_number", card_number)
-    keyring.set_password("KTX", "card_password", card_password)
-    keyring.set_password("KTX", "birthday", birthday)
-    keyring.set_password("KTX", "card_expire", card_expire)
+    store.set_secret("card_number", card_number)
+    store.set_secret("card_password", card_password)
+    store.set_secret("birthday", birthday)
+    store.set_secret("card_expire", card_expire)
     click.echo("카드 정보가 저장되었습니다.")
     return True
 
@@ -1431,11 +1546,7 @@ def _ensure_card_for_auto_pay() -> bool:
             return True
 
     click.echo(
-        "  설정 방법:\n"
-        "    keyring set KTX card_number\n"
-        "    keyring set KTX card_password\n"
-        "    keyring set KTX birthday\n"
-        "    keyring set KTX card_expire"
+        "  카드 등록: ktxgo --set-card (또는 메뉴의 '카드 등록/수정')"
     )
     return False
 
@@ -1448,11 +1559,7 @@ def _do_pay(
     if card is None:
         click.echo(
             f"[{_now()}] Auto-pay skipped: card not configured.\n"
-            "  Set card info with:\n"
-            "    keyring set KTX card_number\n"
-            "    keyring set KTX card_password\n"
-            "    keyring set KTX birthday\n"
-            "    keyring set KTX card_expire"
+            "  카드 등록: ktxgo --set-card (또는 메뉴의 '카드 등록/수정')"
         )
         return False
 
@@ -1503,8 +1610,8 @@ def _send_telegram(
     waitlist_alert_status: str | None = None,
 ) -> None:
     """Send reservation/payment notification via Telegram."""
-    token = keyring.get_password("telegram", "token")
-    chat_id = keyring.get_password("telegram", "chat_id")
+    token = store.get_secret("telegram_token")
+    chat_id = store.get_secret("telegram_chat_id")
     if not token or not chat_id:
         click.echo(f"[{_now()}] Telegram skipped: token/chat_id not configured.")
         return
@@ -1551,7 +1658,7 @@ def _send_telegram(
 
 def _resolve_waitlist_alert_phone(phone: str | None) -> str | None:
     resolved = (
-        phone or keyring.get_password("KTX", "waitlist_alert_phone") or ""
+        phone or store.get_secret("waitlist_alert_phone") or ""
     ).strip()
     digits_only = "".join(ch for ch in resolved if ch.isdigit())
     return digits_only or None
@@ -1742,6 +1849,8 @@ def main(
                         train_types,
                     )
                     break
+                except MacroBlockedError as exc:
+                    _abort_macro_blocked(exc, phase="열차 조회")
                 except KorailError as exc:
                     code = exc.code or ""
                     if code in _SESSION_EXPIRED_CODES:
@@ -1790,17 +1899,23 @@ def main(
                     train_types=train_types,
                 )
                 consecutive_errors = 0
+            except MacroBlockedError as exc:
+                _abort_macro_blocked(exc, phase="열차 조회")
             except KorailError as exc:
                 consecutive_errors += 1
                 code = exc.code or ""
+                # Checked before the session-expiry branch: otherwise a session
+                # that keeps dropping would re-login forever without ever
+                # reaching this ceiling.
+                if consecutive_errors >= _MAX_CONSECUTIVE_SEARCH_ERRORS:
+                    click.echo(f"[{_now()}] Search error: {exc}")
+                    click.echo("Too many consecutive errors. Exiting.")
+                    sys.exit(1)
                 if code in _SESSION_EXPIRED_CODES:
                     click.echo(f"[{_now()}] Session expired. Re-authenticating...")
                     api = _ensure_login(api, manager, headless)
                     continue
                 click.echo(f"[{_now()}] Search error: {exc}")
-                if consecutive_errors >= 5:
-                    click.echo("Too many consecutive errors. Exiting.")
-                    sys.exit(1)
                 time.sleep(POLL_INTERVAL_S * 2)
                 continue
 
@@ -1847,6 +1962,8 @@ def main(
                         adults=adults,
                         waitlist=waitlist,
                     )
+                except MacroBlockedError as exc:
+                    _abort_macro_blocked(exc, phase="예약 시도")
                 except KorailError as exc:
                     code = exc.code or ""
                     if code in _SESSION_EXPIRED_CODES:

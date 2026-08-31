@@ -34,6 +34,14 @@ class KorailError(RuntimeError):
         self.code: str | None = code
 
 
+class MacroBlockedError(KorailError):
+    """Korail's DynaPath anti-macro filter rejected the request.
+
+    Retrying deepens the block instead of clearing it, so callers must stop
+    rather than re-authenticate or back off.
+    """
+
+
 @dataclass(slots=True)
 class Train:
     train_no: str
@@ -571,6 +579,17 @@ class KorailAPI:
             raise KorailError(f"Unexpected JSON payload from {endpoint}")
 
         data = cast(dict[str, object], raw_data)
+
+        # DynaPath answers with its own payload shape that carries no
+        # strResult, so without this check a block reads as an empty result
+        # set and the caller silently retries forever.
+        err_code = str(data.get("errCode", "")).strip()
+        dyna_code = str(data.get("dynaPathResultCode", "")).strip()
+        if err_code or dyna_code:
+            raise MacroBlockedError(
+                str(data.get("errMsg") or "Blocked by Korail anti-macro filter"),
+                err_code or dyna_code,
+            )
 
         if str(data.get("strResult", "")) == "FAIL":
             raise KorailError(
@@ -1182,6 +1201,10 @@ class KorailAPI:
     def is_logged_in(self) -> bool:
         try:
             data = self._api_call(API_LOGIN_CHECK, {})
+        except MacroBlockedError:
+            # Being blocked is not the same as being logged out; swallowing it
+            # here would make callers "recover" by logging in again.
+            raise
         except KorailError:
             return False
 
