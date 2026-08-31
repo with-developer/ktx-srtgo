@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHOICE_FILE="${ROOT_DIR}/.install_manager"
 CONDA_ENV_FILE="${ROOT_DIR}/.install_conda_env"
 PYTHON_VERSION="3.11"
-CONDA_ENV_NAME="srtgo-env"
+CONDA_ENV_NAME="ktxgo-env"
 MANAGER=""
 RECONFIGURE=0
 
@@ -16,7 +16,7 @@ Usage: ./install.sh [options]
 Options:
   --uv                 Use uv (skip prompt)
   --conda              Use conda (skip prompt)
-  --env-name NAME      Conda env name (default: srtgo-env)
+  --env-name NAME      Conda env name (default: ktxgo-env)
   --reconfigure        Re-select package manager and overwrite saved choice
   -h, --help           Show this help
 EOF
@@ -89,7 +89,7 @@ setup_uv() {
   log "Creating/updating uv virtual environment (.venv)"
   uv venv --python "${PYTHON_VERSION}" "${ROOT_DIR}/.venv"
 
-  log "Installing Python dependencies for srtgo + ktxgo"
+  log "Installing Python dependencies for ktxgo"
   uv pip install --python "${ROOT_DIR}/.venv/bin/python" -e "${ROOT_DIR}" playwright
 
   log "Installing Playwright Firefox browser"
@@ -107,7 +107,6 @@ Run:
   
   or 
   
-  python -m srtgo.srtgo
   python -m ktxgo
 EOF
 }
@@ -126,7 +125,7 @@ setup_conda() {
     conda create -y -n "${CONDA_ENV_NAME}" "python=${PYTHON_VERSION}" pip
   fi
 
-  log "Installing Python dependencies for srtgo + ktxgo"
+  log "Installing Python dependencies for ktxgo"
   conda run -n "${CONDA_ENV_NAME}" pip install -e "${ROOT_DIR}" playwright
 
   log "Installing Playwright Firefox browser"
@@ -147,7 +146,6 @@ Run:
   
   or 
   
-  python -m srtgo.srtgo
   python -m ktxgo
 EOF
 }

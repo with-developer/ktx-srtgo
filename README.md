@@ -1,5 +1,8 @@
-# KTX-SRTgo: K-Train (KTX, SRT) Reservation Assistant
-📌 최근 코레일톡 업데이트로 KTX API에서 사용자 토큰 기반 MACRO 차단 이슈를 해결하기 위해 제작되었습니다.
+# KTXgo: 코레일(KTX) 예매 도우미
+📌 코레일 웹의 DynaPath 매크로 차단을 우회하기 위해 Playwright 기반으로 제작되었습니다.
+
+> 2026년 9월 1일 SRT가 코레일로 통합되어 SRT 브랜드가 폐지되면서, 수서발 열차도 KTX(KTX-산천)로
+> 조회·예매됩니다. 이에 따라 SRT 전용 코드(`srtgo`)는 제거되었습니다.
 
 [![Upload Python Package](https://github.com/lapis42/srtgo/actions/workflows/python-publish.yml/badge.svg)](https://github.com/lapis42/srtgo/actions/workflows/python-publish.yml)
 [![Downloads](https://static.pepy.tech/badge/srtgo)](https://pepy.tech/project/srtgo)
@@ -29,7 +32,7 @@
 
 첫 실행 시 환경 관리자를 선택합니다.
 - `uv`: `.venv` 생성
-- `conda`: 기본 `srtgo-env` 생성 (`--env-name`으로 변경 가능)
+- `conda`: 기본 `ktxgo-env` 생성 (`--env-name`으로 변경 가능)
 
 자주 쓰는 옵션:
 
@@ -47,15 +50,9 @@
 
 `run.sh`는 다음을 자동으로 처리합니다.
 - `install.sh`에서 선택한 환경(`uv`/`conda`) 활성화
-- 화살표 메뉴로 `KTX` / `SRT` 선택 후 실행
-- `KTX`는 저장 세션이 만료되면 `KTX id/pass`로 Playwright 자동로그인을 시도하고, 실패 시 브라우저 계정 자동입력 후 사용자 클릭 로그인으로 전환합니다.
-
-직접 지정 실행:
-
-```bash
-./run.sh --ktx
-./run.sh --srt
-```
+- KTXgo 실행
+- 저장 세션이 만료되면 `KTX id/pass`로 자동 로그인을 시도하고, 실패하면 브라우저 수동 로그인으로 전환합니다.
+  (자동 로그인은 1시간에 3회로 제한되며, 안티매크로 차단이 감지되면 재시도하지 않고 즉시 중지합니다.)
 
 ### 3) (선택) bash alias 등록
 
@@ -73,7 +70,6 @@ source ~/.bashrc
 직접 커맨드로 실행할 수도 있습니다.
 
 ```bash
-python -m srtgo.srtgo
 python -m ktxgo
 ```
 
