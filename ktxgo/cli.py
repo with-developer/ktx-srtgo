@@ -22,6 +22,7 @@ from .config import (
     DEFAULT_DEPARTURE,
     DEFAULT_TRAIN_TYPES,
     DEFAULT_VISIBLE_STATIONS,
+    MERGER_STATIONS,
     POLL_INTERVAL_S,
     STORAGE_STATE_PATH,
     STATIONS,
@@ -717,8 +718,33 @@ def _load_visible_stations() -> list[str]:
     selected = {
         station.strip() for station in station_key.split(",") if station.strip()
     }
+    selected |= _merger_stations_to_add(selected)
     ordered = [station for station in STATIONS if station in selected]
     return ordered if ordered else list(STATIONS)
+
+
+def _merger_stations_to_add(selected: set[str]) -> set[str]:
+    """Fold post-merger stations into a list saved before the merger, once.
+
+    Suseo-line stations only became reachable as KTX on 2026-09-01, so a
+    saved list from before then cannot mention them and the station would
+    silently stay missing from the booking prompts. Adding them is a
+    one-shot migration: the flag means a later removal by the user sticks.
+    """
+    if store.get_pref("merger_stations_added"):
+        return set()
+
+    missing = {station for station in MERGER_STATIONS if station not in selected}
+    store.set_pref("merger_stations_added", "1")
+    if not missing:
+        return set()
+
+    merged = selected | missing
+    store.set_pref(
+        "station", ",".join(station for station in STATIONS if station in merged)
+    )
+    click.echo(f"통합으로 KTX 예매가 가능해진 역을 추가했습니다: {', '.join(sorted(missing))}")
+    return missing
 
 
 def _set_visible_stations_interactive() -> bool:

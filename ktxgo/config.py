@@ -208,8 +208,13 @@ DEFAULT_VISIBLE_STATIONS = [
     "서울",
     "용산",
     "광명",
+    "수서",
     "수원",
     "대전",
     "동대구",
     "부산",
 ]
+# Stations that only became bookable as KTX when SRT merged into Korail on
+# 2026-09-01. A station list saved before then cannot contain them, so they
+# are added to existing lists once instead of making everyone edit by hand.
+MERGER_STATIONS = ["수서"]
