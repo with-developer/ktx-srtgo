@@ -24,14 +24,19 @@ from .config import (
     DEFAULT_VISIBLE_STATIONS,
     MERGER_STATIONS,
     POLL_INTERVAL_S,
-    STORAGE_STATE_PATH,
     STATIONS,
     TRAIN_TYPE_LABEL_BY_NAME,
     TRAIN_TYPE_OPTION_CHOICES,
     normalize_train_types,
     TRAIN_TYPE_CODE_BY_NAME,
 )
-from .korail import KorailAPI, KorailError, MacroBlockedError, Train
+from .korail import (
+    BadCredentialsError,
+    KorailAPI,
+    KorailError,
+    MacroBlockedError,
+    Train,
+)
 
 try:
     import termios
@@ -49,6 +54,10 @@ _AUTO_LOGIN_BACKOFF_S = (30.0, 60.0, 120.0)
 _MAX_CONSECUTIVE_SEARCH_ERRORS = 5
 _auto_login_attempts: list[float] = []
 _auto_login_failures = 0
+# Set once Korail answers a login with a refusal or any message of its own:
+# every further try would be another failed login on the account, so the rest
+# of the run leaves it to the user.
+_auto_login_halted = False
 _INTERACTIVE_SCOPE_KTX_ONLY = "ktx_only"
 _INTERACTIVE_SCOPE_KTX_PLUS_GENERAL = "ktx_plus_general"
 _INTERACTIVE_TRAIN_SCOPE_CHOICES = [
@@ -570,24 +579,22 @@ def _set_login_credentials_interactive() -> bool:
 
 def _login_and_save_session(force_relogin: bool = False) -> bool:
     backup_cookie: str | None = None
-    backup_storage_state: str | None = None
-    if force_relogin:
-        if COOKIE_PATH.is_file():
+    if force_relogin and COOKIE_PATH.is_file():
+        try:
+            backup_cookie = COOKIE_PATH.read_text()
+        except OSError:
+            backup_cookie = None
+        try:
+            COOKIE_PATH.unlink()
+        except OSError:
+            pass
+
+    def _restore_backup() -> None:
+        if force_relogin and backup_cookie is not None and not COOKIE_PATH.is_file():
             try:
-                backup_cookie = COOKIE_PATH.read_text()
-            except OSError:
-                backup_cookie = None
-            try:
-                COOKIE_PATH.unlink()
-            except OSError:
-                pass
-        if STORAGE_STATE_PATH.is_file():
-            try:
-                backup_storage_state = STORAGE_STATE_PATH.read_text()
-            except OSError:
-                backup_storage_state = None
-            try:
-                STORAGE_STATE_PATH.unlink()
+                COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                COOKIE_PATH.touch(mode=0o600, exist_ok=True)
+                COOKIE_PATH.write_text(backup_cookie)
             except OSError:
                 pass
 
@@ -598,20 +605,7 @@ def _login_and_save_session(force_relogin: bool = False) -> bool:
             click.echo(f"[{_now()}] 브라우저에서 로그인하세요. (5분 제한)")
             if not api.login_manual(timeout_s=300):
                 click.echo("로그인 시간이 초과되었습니다.")
-                if (
-                    force_relogin
-                    and backup_cookie is not None
-                    and not COOKIE_PATH.is_file()
-                ):
-                    COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    COOKIE_PATH.write_text(backup_cookie)
-                if (
-                    force_relogin
-                    and backup_storage_state is not None
-                    and not STORAGE_STATE_PATH.is_file()
-                ):
-                    STORAGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    STORAGE_STATE_PATH.write_text(backup_storage_state)
+                _restore_backup()
                 return False
 
             manager.save_cookies()
@@ -625,22 +619,7 @@ def _login_and_save_session(force_relogin: bool = False) -> bool:
                 )
             return True
     except Exception as exc:
-        if force_relogin and backup_cookie is not None and not COOKIE_PATH.is_file():
-            try:
-                COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                COOKIE_PATH.write_text(backup_cookie)
-            except OSError:
-                pass
-        if (
-            force_relogin
-            and backup_storage_state is not None
-            and not STORAGE_STATE_PATH.is_file()
-        ):
-            try:
-                STORAGE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                STORAGE_STATE_PATH.write_text(backup_storage_state)
-            except OSError:
-                pass
+        _restore_backup()
         click.echo(f"[{_now()}] 로그인 설정 실패: {exc}")
         return False
 
@@ -1333,6 +1312,17 @@ def _abort_macro_blocked(exc: KorailError, *, phase: str) -> NoReturn:
     sys.exit(1)
 
 
+def _http_error_hint(code: str) -> str | None:
+    """Explain the bare HTML error page Korail returns for a request it refuses."""
+    if not code.startswith("HTTP_5"):
+        return None
+    return (
+        "  코레일이 요청을 받아주지 않고 있습니다 (HTTP 5xx). 일시적인 장애이거나\n"
+        "  접속이 제한된 상태일 수 있으니, 브라우저에서 korail.com이 정상인지\n"
+        "  확인한 뒤 잠시 후 다시 실행하세요."
+    )
+
+
 def _auto_login_slots_left() -> int:
     """Remaining automatic logins allowed inside the sliding window."""
     cutoff = time.monotonic() - _AUTO_LOGIN_WINDOW_S
@@ -1355,12 +1345,12 @@ def _reset_auto_login_failures() -> None:
 def _attempt_auto_login(
     manager: BrowserManager, creds: tuple[str, str], *, headless: bool
 ) -> KorailAPI | None:
-    """Run one automated login (prefill + a single submit).
+    """Run one automated login (typed into the real form, a single submit).
 
     Returns a logged-in API handle, or None when the attempt failed. Raises
-    MacroBlockedError if Korail flagged the submit as automation.
+    MacroBlockedError if Korail refused the request as automation.
     """
-    global _auto_login_failures
+    global _auto_login_failures, _auto_login_halted
 
     delay = _auto_login_backoff_delay()
     if delay > 0:
@@ -1372,21 +1362,33 @@ def _attempt_auto_login(
 
     manager.close()
     manager._headless = headless
-    # A stored JSESSIONID that anti-macro already flagged prevents the server
-    # from issuing fresh cookies, so always start the login from a clean slate.
+    # Cookies from a session Korail already turned down would only be turned
+    # down again, so always start the login from a clean slate.
     manager._fresh_session = True
     manager.start()
     api = KorailAPI(manager.page)
 
-    if not api.prefill_login_form(creds[0], creds[1]):
-        _auto_login_failures += 1
-        click.echo(f"[{_now()}] 자동 로그인 실패: 로그인 폼을 찾지 못했습니다.")
+    try:
+        logged_in = api.login_with_credentials(creds[0], creds[1])
+    except BadCredentialsError as exc:
+        _auto_login_halted = True
+        click.echo(f"[{_now()}] 저장된 아이디/비밀번호가 거부되었습니다: {exc}")
+        click.echo(
+            "  잘못된 시도가 계정에 쌓이지 않도록 자동 로그인을 중단합니다.\n"
+            "  메뉴의 '로그인 설정 > 자동로그인 계정 등록/수정'에서 갱신하세요."
+        )
         return None
 
-    # Exactly one submit: repeated automated submits are what trips DynaPath.
-    if not api.submit_prefilled_login(timeout_s=20, max_attempts=1):
-        _auto_login_failures += 1
+    if not logged_in:
         detail = api.last_auto_login_detail or api.last_auto_login_error or "원인 미상"
+        if api.last_auto_login_error == "login_notice":
+            _auto_login_halted = True
+            click.echo(f"[{_now()}] 코레일이 로그인에 안내를 표시했습니다: {detail}")
+            click.echo(
+                "  같은 계정으로 자동 시도를 되풀이하지 않도록 자동 로그인을 중단합니다."
+            )
+            return None
+        _auto_login_failures += 1
         click.echo(f"[{_now()}] 자동 로그인 실패: {detail}")
         return None
 
@@ -1429,7 +1431,9 @@ def _ensure_login(api: KorailAPI, manager: BrowserManager, headless: bool) -> Ko
     # Automatic re-login first, so an overnight session drop recovers without
     # a human. The sliding-window budget and backoff live in the helpers.
     if creds is not None:
-        if _auto_login_slots_left() > 0:
+        if _auto_login_halted:
+            click.echo(f"[{_now()}] 이번 실행에서는 자동 로그인을 다시 시도하지 않습니다.")
+        elif _auto_login_slots_left() > 0:
             try:
                 auto_api = _attempt_auto_login(manager, creds, headless=headless)
             except MacroBlockedError as exc:
@@ -1453,9 +1457,8 @@ def _ensure_login(api: KorailAPI, manager: BrowserManager, headless: bool) -> Ko
         )
         sys.exit(1)
 
-    # Manual fallback. Force a clean session: the stored storage_state can
-    # carry an anti-macro-flagged JSESSIONID that prevents the server from
-    # issuing fresh cookies, which in turn causes MACRO ERROR on submit.
+    # Manual fallback. Force a clean session so cookies from the session that
+    # just failed cannot follow the user into the login window.
     click.echo(f"[{_now()}] 수동 로그인으로 전환합니다. 브라우저를 엽니다...")
     api = _restart_browser(headed=True, fresh=True)
 
@@ -1936,6 +1939,9 @@ def main(
                 if consecutive_errors >= _MAX_CONSECUTIVE_SEARCH_ERRORS:
                     click.echo(f"[{_now()}] Search error: {exc}")
                     click.echo("Too many consecutive errors. Exiting.")
+                    hint = _http_error_hint(code)
+                    if hint:
+                        click.echo(hint)
                     sys.exit(1)
                 if code in _SESSION_EXPIRED_CODES:
                     click.echo(f"[{_now()}] Session expired. Re-authenticating...")

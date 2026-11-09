@@ -1,6 +1,6 @@
 # KTXgo
 
-Playwright(Firefox) 기반 코레일 열차 예매 자동화 CLI.
+Chrome(CDP) 기반 코레일 열차 예매 자동화 CLI.
 
 코레일 웹사이트의 DynaPath 매크로 차단을 우회하여 열차 검색 → 좌석 예매/예약대기 → 자동결제 → 텔레그램 알림까지 자동화합니다.
 
@@ -8,19 +8,18 @@ Playwright(Firefox) 기반 코레일 열차 예매 자동화 CLI.
 
 ## 동작 원리
 
-1. **Playwright Firefox**로 korail.com에 접속하여 DynaPath JS를 정상 로드
+1. 설치된 **Google Chrome**을 직접 실행하고(임시 프로필), korail.com에 접속하여 DynaPath JS를 정상 로드
 2. 브라우저 컨텍스트 내에서 `fetch()` API를 직접 호출하여 열차 검색·예약·결제 수행
-3. DynaPath는 Chrome CDP를 차단하지만 **Firefox에서는 감지하지 않음**
-4. 로그인은 DynaPath의 최엄격 보호 대상이므로 **수동 로그인 + 쿠키 저장** 방식 사용
+3. Chrome은 **아무 CDP 도메인도 켜지 않는 최소 클라이언트**(`cdp.py`)로만 조종합니다. Playwright가 켜는 기능(`Runtime.enable` 등)이 DynaPath에 잡혀 로그인과 조회가 거부되기 때문입니다 (아래 '기술적 세부사항')
+4. 로그인은 저장된 계정을 실제 폼에 한 글자씩 입력해 **1회만 제출**하고, 세션 쿠키를 저장해 재사용합니다
 
 ## 요구사항
 
 - Python 3.10+
-- [Playwright](https://playwright.dev/python/) (Firefox)
+- Google Chrome (다른 위치에 있으면 `KTXGO_CHROME`에 실행 파일 경로 지정)
 
 ```bash
-pip install playwright click keyring keyrings.alt python-telegram-bot
-playwright install firefox
+pip install click inquirer keyring keyrings.alt python-telegram-bot termcolor websockets
 ```
 
 ## 초기 설정
@@ -29,7 +28,7 @@ playwright install firefox
 
 ```bash
 keyring set KTX id        # 회원번호
-keyring set KTX pass      # 비밀번호 (세션 만료 시 Playwright 자동로그인에 사용)
+keyring set KTX pass      # 비밀번호 (세션 만료 시 자동 로그인에 사용)
 ```
 
 ### 카드 정보 (자동결제 사용 시)
@@ -131,10 +130,12 @@ python3 -m ktxgo \
 시작
  ├─ 저장된 쿠키로 로그인 확인
  │   ├─ 성공 → headless 모드로 진행
- │   └─ 실패 → 저장된 계정(KTX id/pass)으로 Playwright 자동로그인 시도
- │            ├─ 성공 → 세션 저장 → (필요 시) headless 전환
- │            └─ 실패 → 브라우저 창 전환 + 계정 자동입력(prefill) 후 사용자 로그인 클릭 대기 (5분)
- │                     └─ 로그인 성공 → 세션 저장 → (필요 시) headless 전환
+ │   └─ 실패 → 저장된 계정(KTX id/pass)으로 자동 로그인 (실제 폼에 입력, 제출 1회)
+ │            ├─ 성공 → 세션 저장
+ │            ├─ 차단(통신 중 에러) → 재시도 없이 즉시 중지
+ │            ├─ 계정 거부(잘못 입력) → 자동 로그인 중단 (실패 로그인이 계정에 쌓이지 않도록)
+ │            └─ 그 외 실패/한도 초과(1시간 3회, 30·60·120초 백오프)
+ │                  → 브라우저 창을 띄워 사용자가 직접 로그인 (5분) → 세션 저장 → (필요 시) headless 전환
  │
  ├─ (interactive 모드) 시작 메뉴
  │   ├─ 로그인 설정
@@ -169,8 +170,11 @@ ktxgo/
 ├── __init__.py     # 패키지 초기화, 버전
 ├── __main__.py     # python -m ktxgo 진입점
 ├── config.py       # API 엔드포인트, 역 목록, 상수
-├── browser.py      # Playwright Firefox 관리, 쿠키 저장/복원
-├── korail.py       # KorailAPI (검색, 예약, 결제, 로그인 확인)
+├── cdp.py          # 최소 Chrome DevTools Protocol 클라이언트 (도메인 enable 없음)
+├── browser.py      # Chrome 실행/종료, 임시 프로필, 쿠키 저장/복원
+├── korail.py       # KorailAPI (검색, 예약, 결제, 로그인)
+├── store.py        # 설정(prefs.json) / 비밀(키체인 항목 1개) 저장
+├── keyring_bootstrap.py  # keyring 백엔드 폴백
 └── cli.py          # Click CLI, 매크로 루프, 자동결제, 텔레그램
 ```
 
@@ -178,28 +182,41 @@ ktxgo/
 
 | 파일 | 경로 | 설명 |
 |------|------|------|
-| 쿠키 | `~/.ktxgo/cookies.json` | 브라우저 세션 쿠키 |
-| 카드/계정/알림전화 | OS keyring | `keyring` 라이브러리 사용 (`KTX id/pass`, 카드 정보, `KTX waitlist_alert_phone`) |
+| 쿠키 | `~/.ktxgo/cookies.json` | 브라우저 세션 쿠키 (0600) |
+| 설정 | `~/.ktxgo/prefs.json` | 역 목록, 마지막 조회 조건 (비밀 아님) |
+| 계정/카드/알림전화/텔레그램 | OS keyring 항목 1개 (`KTX` / `ktxgo-secrets`) | JSON으로 묶어 저장해 키체인 접근을 실행당 1회로 줄임 |
 
 ## 기술적 세부사항
 
-### DynaPath 우회
+### DynaPath
 
 코레일은 DynaPath SDK를 사용하여 매크로/봇을 차단합니다:
 
-- **loginProcess**: 최엄격 보호 → 저장 계정 자동입력, 실패 시 수동 로그인으로 우회
-- **ScheduleView**: `web_s` 레벨 보호 → Firefox fetch()로 우회
-- **TicketReservation**: `web_r` 레벨 보호 → Firefox fetch()로 우회
+- **loginProcess**: 최엄격 보호. 요청이 `/dynaPath/…`(또는 `/web_s/…`) 주소로 감싸져 전송되고, 거부되면 HTTP 500이 돌아와 화면에는 "통신 중 에러가 발생하였습니다"가 뜹니다
+- **ScheduleView**: `web_s` 레벨 보호
+- **TicketReservation**: `web_r` 레벨 보호
 - **ReservationWait**: 예약대기 후 좌석배정 SMS 알림 전화번호 등록
 - **ReservationPayment**: dpCnf 목록에 없음 → 직접 fetch() 호출 가능
 
-### Chrome vs Firefox
+### Playwright가 막히는 이유 (2026-09 실측)
 
-| | Chrome (CDP) | Firefox (Playwright) |
+같은 Chrome, 같은 계정, 같은 IP에서 조종 방식만 바꿔 비교한 결과입니다.
+
+| 조종 방식 | 로그인 | 사이트 자신의 조회 클릭 |
 |---|---|---|
-| DynaPath 감지 | O (차단됨) | X (우회됨) |
-| `navigator.webdriver` | 감지됨 | 제거 가능 |
-| 결과 | 매크로 오류 | 정상 동작 |
+| 사람이 직접 (CDP 없음) | 정상 | 정상 |
+| Playwright로 실행 / Playwright로 연결 | **"통신 중 에러"** (HTTP 500) | **HTTP 500** ("운행하는 열차가 없습니다"로 표시) |
+| 최소 CDP (`Page.navigate`·`Runtime.evaluate`·`Input.*`만) | 정상 | 정상 |
+
+- 사람이 로그인한 창에 Playwright가 붙기만 해도 그 창의 조회가 거부되고, 연결을 끊고 최소 CDP로 다시 하면 같은 세션에서 통과합니다. 낙인이 세션에 남는 방식이 아니라 **요청 시점에 보이는 CDP 사용 흔적**을 검사합니다.
+- 플래그 없이 평범하게 띄운 Chrome에 Playwright만 붙여도 거부되므로 실행 플래그·뷰포트 에뮬레이션이 원인이 아닙니다.
+- 그래서 `cdp.py`는 `*.enable` 계열 명령을 보내지 않습니다 (테스트가 이를 강제합니다).
+
+### 브라우저 실행 시 주의한 점
+
+- `--remote-debugging-port=0`(자동 배정)으로 띄우면 `navigator.webdriver`가 `true`가 됩니다. 그래서 비어 있는 포트를 골라 고정 포트로 실행합니다.
+- headless Chrome은 User-Agent에 `HeadlessChrome`을 싣고, DynaPath는 이 문자열을 거부합니다. CDP 재정의(Emulation) 없이 `--user-agent` 실행 인자로 일반 Chrome과 같은 값을 넘깁니다.
+- 디버그 포트는 `127.0.0.1`에만 열리며 실행 중에만 존재합니다. 같은 PC의 다른 프로세스는 그동안 접속할 수 있습니다.
 
 ## 감사의 말
 

@@ -90,10 +90,8 @@ setup_uv() {
   uv venv --python "${PYTHON_VERSION}" "${ROOT_DIR}/.venv"
 
   log "Installing Python dependencies for ktxgo"
-  uv pip install --python "${ROOT_DIR}/.venv/bin/python" -e "${ROOT_DIR}" playwright
+  uv pip install --python "${ROOT_DIR}/.venv/bin/python" -e "${ROOT_DIR}"
 
-  log "Installing Playwright Firefox browser"
-  uv run --python "${ROOT_DIR}/.venv/bin/python" playwright install firefox
 
   cat <<EOF
 
@@ -126,10 +124,8 @@ setup_conda() {
   fi
 
   log "Installing Python dependencies for ktxgo"
-  conda run -n "${CONDA_ENV_NAME}" pip install -e "${ROOT_DIR}" playwright
+  conda run -n "${CONDA_ENV_NAME}" pip install -e "${ROOT_DIR}"
 
-  log "Installing Playwright Firefox browser"
-  conda run -n "${CONDA_ENV_NAME}" python -m playwright install firefox
 
   printf '%s\n' "${CONDA_ENV_NAME}" > "${CONDA_ENV_FILE}"
   log "Saved conda environment name: ${CONDA_ENV_NAME}"

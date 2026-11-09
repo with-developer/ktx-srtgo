@@ -600,6 +600,7 @@ class _LoggedOutAPI:
 def _prepare_auto_login_state() -> None:
     cli._auto_login_attempts.clear()
     cli._reset_auto_login_failures()
+    cli._auto_login_halted = False
 
 
 def test_ensure_login_prefers_automatic_login(monkeypatch) -> None:
