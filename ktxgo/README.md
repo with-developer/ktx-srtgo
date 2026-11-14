@@ -174,6 +174,7 @@ ktxgo/
 ├── browser.py      # Chrome 실행/종료, 임시 프로필, 쿠키 저장/복원
 ├── korail.py       # KorailAPI (검색, 예약, 결제, 로그인)
 ├── store.py        # 설정(prefs.json) / 비밀(키체인 항목 1개) 저장
+├── runlog.py       # 실행 기록 (화면 출력을 ~/.ktxgo/logs/에 복사)
 ├── keyring_bootstrap.py  # keyring 백엔드 폴백
 └── cli.py          # Click CLI, 매크로 루프, 자동결제, 텔레그램
 ```
@@ -184,6 +185,7 @@ ktxgo/
 |------|------|------|
 | 쿠키 | `~/.ktxgo/cookies.json` | 브라우저 세션 쿠키 (0600) |
 | 설정 | `~/.ktxgo/prefs.json` | 역 목록, 마지막 조회 조건 (비밀 아님) |
+| 실행 기록 | `~/.ktxgo/logs/YYYYMMDD-HHMMSS.log` | 실행마다 새 파일. 화면 출력에 시각을 붙여 저장(0600). 메뉴 화면·같은 조회 결과 반복은 빼고, 조회마다 `조회 요청 #N` 줄을 남김. 끝에 `실행 종료`가 없으면 비정상 종료. 자동 삭제 없음 |
 | 계정/카드/알림전화/텔레그램 | OS keyring 항목 1개 (`KTX` / `ktxgo-secrets`) | JSON으로 묶어 저장해 키체인 접근을 실행당 1회로 줄임 |
 
 ## 기술적 세부사항

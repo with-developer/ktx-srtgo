@@ -6,6 +6,7 @@ import sys
 import time
 import unicodedata
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import NoReturn, cast
 
 import click
@@ -13,7 +14,7 @@ import inquirer
 from click.core import ParameterSource
 from termcolor import colored
 
-from . import store
+from . import runlog, store
 from .browser import BrowserManager
 from .keyring_bootstrap import configure_keyring_backend
 from .config import (
@@ -446,7 +447,8 @@ def _list_input_guarded(
 ) -> object:
     _prepare_tty_prompt()
     try:
-        return inquirer.list_input(message=message, choices=choices, **kwargs)
+        with runlog.paused():
+            return inquirer.list_input(message=message, choices=choices, **kwargs)
     finally:
         _finish_tty_prompt()
 
@@ -454,7 +456,8 @@ def _list_input_guarded(
 def _prompt_guarded(questions: list[object]) -> dict[str, object] | None:
     _prepare_tty_prompt()
     try:
-        return inquirer.prompt(questions)
+        with runlog.paused():
+            return inquirer.prompt(questions)
     finally:
         _finish_tty_prompt()
 
@@ -1065,6 +1068,13 @@ def _resolve_targets(
     return found, missing
 
 
+def _display_path(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
 def _target_summary(targets: list[TrainKey] | None) -> str | None:
     if not targets:
         return None
@@ -1074,13 +1084,20 @@ def _target_summary(targets: list[TrainKey] | None) -> str | None:
 
 
 def _render_screen(
-    status_line: str, target_line: str | None, clear_screen: bool
+    status_line: str,
+    target_line: str | None,
+    clear_screen: bool,
+    log_line: str | None = None,
 ) -> None:
-    if clear_screen:
-        click.clear()
-    click.echo(status_line)
-    if target_line:
-        click.echo(target_line)
+    # The header is the same on every attempt; the log gets it once instead.
+    with runlog.paused():
+        if clear_screen:
+            click.clear()
+        click.echo(status_line)
+        if target_line:
+            click.echo(target_line)
+        if log_line:
+            click.echo(log_line)
 
 
 def _first_non_empty(row: dict[str, object], keys: tuple[str, ...]) -> str:
@@ -1254,7 +1271,7 @@ def _reservation_plan(train: Train, seat: str) -> ReservationPlan | None:
     return None
 
 
-def _print_results(trains: list[Train]) -> None:
+def _result_lines(trains: list[Train]) -> list[str]:
     header = _format_row(
         [
             ("idx", 3, "right"),
@@ -1269,8 +1286,7 @@ def _print_results(trains: list[Train]) -> None:
             ("price", 7, "right"),
         ]
     )
-    click.echo(header)
-    click.echo("-" * len(header))
+    lines = [header, "-" * len(header)]
     for idx, train in enumerate(trains):
         route = f"{train.departure}->{train.arrival}"
         tm = f"{train.dep_time}-{train.arr_time}"
@@ -1289,7 +1305,8 @@ def _print_results(trains: list[Train]) -> None:
                 (price, 7, "right"),
             ]
         )
-        click.echo(row)
+        lines.append(row)
+    return lines
 
 
 def _abort_macro_blocked(exc: KorailError, *, phase: str) -> NoReturn:
@@ -1768,6 +1785,7 @@ def main(
     telegram: bool,
     waitlist_alert_phone: str | None,
 ) -> None:
+    log_path = runlog.start()
     configure_keyring_backend()
 
     if set_card_mode:
@@ -1907,17 +1925,28 @@ def main(
             f"{' auto-pay' if auto_pay else ''}{' telegram' if telegram else ''}"
         )
 
+        log_line = f"기록: {_display_path(log_path)}" if log_path else None
+        runlog.note(status_line)
+        if target_line:
+            runlog.note(target_line)
+
         if not clear_each_attempt:
-            _render_screen(status_line, target_line, clear_screen=False)
+            _render_screen(status_line, target_line, clear_screen=False, log_line=log_line)
 
         attempt = 0
         consecutive_errors = 0
+        previous_result_lines: list[str] | None = None
         while max_attempts == 0 or attempt < max_attempts:
             attempt += 1
 
             if clear_each_attempt:
-                _render_screen(status_line, target_line, clear_screen=True)
+                _render_screen(
+                    status_line, target_line, clear_screen=True, log_line=log_line
+                )
 
+            # Paired with the "Attempt" line printed on success, this shows in
+            # the log whether a long silence was spent waiting on Korail.
+            runlog.note(f"조회 요청 #{attempt}")
             try:
                 trains = api.search(
                     departure,
@@ -1957,7 +1986,13 @@ def main(
                 time.sleep(POLL_INTERVAL_S)
                 continue
 
-            _print_results(trains)
+            result_lines = _result_lines(trains)
+            # An unchanged table is left out of the log; the Attempt line above
+            # already records that this search happened.
+            with runlog.paused(result_lines == previous_result_lines):
+                for line in result_lines:
+                    click.echo(line)
+            previous_result_lines = result_lines
 
             candidate_trains = trains
             if target_trains is not None:
