@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import cast
 
+from . import runlog
 from .cdp import CdpError, CdpPage
 from .config import (
     API_LOGIN_CHECK,
@@ -229,6 +230,7 @@ class KorailAPI:
         err_code = str(data.get("errCode", "")).strip()
         dyna_code = str(data.get("dynaPathResultCode", "")).strip()
         if err_code or dyna_code:
+            runlog.note(f"차단 응답 원문 ({endpoint}, HTTP {status}): {text[:2000]}")
             raise MacroBlockedError(
                 str(data.get("errMsg") or "Blocked by Korail anti-macro filter"),
                 err_code or dyna_code,

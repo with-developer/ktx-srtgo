@@ -1068,6 +1068,22 @@ def _resolve_targets(
     return found, missing
 
 
+def _normalize_train_no(value: str) -> str:
+    return value.strip().lstrip("0") or "0"
+
+
+def _normalize_train_nos(values: tuple[str, ...]) -> set[str]:
+    wanted: set[str] = set()
+    for value in values:
+        for part in value.split(","):
+            if not part.strip():
+                continue
+            if not part.strip().isdigit():
+                raise click.BadParameter(f"not a train number: {part}", param_hint="--train")
+            wanted.add(_normalize_train_no(part))
+    return wanted
+
+
 def _display_path(path: Path) -> str:
     try:
         return "~/" + str(path.relative_to(Path.home()))
@@ -1320,7 +1336,7 @@ def _abort_macro_blocked(exc: KorailError, *, phase: str) -> NoReturn:
             attrs=["bold"],
         )
     )
-    click.echo(f"  응답: {exc}")
+    click.echo(f"  응답: {exc}" + (f" (코드: {exc.code})" if exc.code else ""))
     click.echo(
         "  재시도하면 차단이 강화되므로 즉시 중지합니다.\n"
         "  시간을 두고(수십 분 이상) 다시 시도하고, 그 전에 브라우저에서\n"
@@ -1739,6 +1755,12 @@ def _resolve_waitlist_alert_phone(phone: str | None) -> str | None:
     help="Train classes to search and reserve",
 )
 @click.option(
+    "--train",
+    "train_nos",
+    multiple=True,
+    help="Only watch and reserve these train numbers (repeatable), e.g. --train 426",
+)
+@click.option(
     "--seat",
     type=click.Choice(["general", "special", "any", "standing"]),
     default="any",
@@ -1784,6 +1806,7 @@ def main(
     smart_ticket: bool,
     telegram: bool,
     waitlist_alert_phone: str | None,
+    train_nos: tuple[str, ...] = (),
 ) -> None:
     log_path = runlog.start()
     configure_keyring_backend()
@@ -1919,6 +1942,10 @@ def main(
                 else:
                     sys.exit(0)
 
+        wanted_train_nos = _normalize_train_nos(train_nos)
+        if wanted_train_nos and target_line is None:
+            target_line = "대상 열차: " + ", ".join(sorted(wanted_train_nos, key=int))
+
         status_line = (
             f"KTXgo — {departure} → {arrival}  {date} {time_str}:00  "
             f"adults={adults} seat={seat} train-types={','.join(train_types)}"
@@ -1995,6 +2022,19 @@ def main(
             previous_result_lines = result_lines
 
             candidate_trains = trains
+            if wanted_train_nos:
+                candidate_trains = [
+                    train
+                    for train in candidate_trains
+                    if _normalize_train_no(train.train_no) in wanted_train_nos
+                ]
+                if not candidate_trains:
+                    click.echo(
+                        "Selected trains not present now: "
+                        f"{len(wanted_train_nos)}/{len(wanted_train_nos)}"
+                    )
+                    time.sleep(POLL_INTERVAL_S)
+                    continue
             if target_trains is not None:
                 candidate_trains, missing_count = _resolve_targets(
                     trains, target_trains
